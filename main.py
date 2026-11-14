@@ -361,7 +361,13 @@ async def broadcast_roster() -> None:
         if not c.name or c.name in seen:
             continue          # 同名只算一次（同一账号多开不重复出现在名单里）
         seen.add(c.name)
-        users.append({"name": c.name, "ip": c.ip, "same_ip_as": c.same_ip_as})
+        uid = c.user_id or 0
+        users.append({
+            "name": c.name,
+            "ip": c.ip,
+            "same_ip_as": c.same_ip_as,
+            "last_read_id": get_last_read(uid) if uid else 0,
+        })
     await broadcast({"type": "roster", "online": online_ip_count(), "users": users})
 
 
@@ -546,6 +552,12 @@ async def handle_read(me: Client, data: dict) -> None:
         "count": count_unread(me.user_id, last_read),
         "last_read_id": last_read,
     })
+    # 告诉所有人：这个人读到了哪一条
+    await broadcast({
+        "type": "read_update",
+        "name": me.name,
+        "last_read_id": last_read,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +739,8 @@ PAGE = """
   #jump:hover{background:#1e40af}
   @media (max-width:790px){ #jump{right:16px} }
 
+  .receipt{display:block;font-size:11px;color:#cbd5e1;text-align:right;margin-top:3px}
+
   /* 轻量提示条 */
   #toast{position:fixed;left:50%;bottom:132px;z-index:40;
          transform:translateX(-50%) translateY(8px);
@@ -769,7 +783,6 @@ PAGE = """
     <div class="meta">
       <span>我：<b id="me">-</b></span>
       <span>在线：<b id="online">0</b> 人</span>
-      <span>未读：<b id="unread">0</b></span>
       <span id="conn">正在连接…</span>
     </div>
   </header>
@@ -812,6 +825,8 @@ let lastSendAt = 0;
 const pending = new Map();     // client_id -> {el, text, id}
 const ownSent = new Set();     // 已确认的 client_id：广播回传时用它去重
 const ipMap = new Map();       // 昵称 -> 关联的同 IP 昵称
+const reads = new Map();       // 在线昵称 -> 已读到哪条消息 id
+const myMsgs = new Map();      // 我发出的消息 id -> <li> 元素
 let newCount = 0;              // 屏幕外的未读新消息数（悬浮按钮显示）
 const MAX_TEXT = 500;
 
@@ -929,7 +944,8 @@ function live(msg) {
     case "recall":    onRecall(msg); break;
     case "system":    addSystem(msg.message); break;
     case "roster":    onRoster(msg); break;
-    case "unread":    setUnread(msg.count); lastReadId = msg.last_read_id; break;
+    case "unread":      lastReadId = msg.last_read_id; break;
+    case "read_update": reads.set(msg.name, msg.last_read_id); refreshReceipts(); break;
     case "error":     showErr(msg.message); toast(msg.message); break;
   }
 }
@@ -944,10 +960,12 @@ function renderHistory(messages, lastRead, unreadCount, hasMore, batch) {
   ensureLoadMore(batch);
 
   messages.forEach((m) => {
-    $("list").appendChild(buildMessage({
+    const li = buildMessage({
       id: m.id, name: m.name, text: m.text, created_at: m.created_at,
-      recalled: m.recalled, mine: m.mine, sameIp: (m.ip === myIp && m.name !== myName)
-    }));
+      recalled: m.recalled, mine: m.mine
+    });
+    $("list").appendChild(li);
+    if (m.mine) registerMine(m.id, li);
     if (!firstUnreadId && m.id > lastReadId && !m.mine) firstUnreadId = m.id;
   });
 
@@ -957,7 +975,7 @@ function renderHistory(messages, lastRead, unreadCount, hasMore, batch) {
 
   if (firstUnreadId) insertDivider(firstUnreadId);
 
-  setUnread(unreadCount || 0);
+  updateBanner();
   if (messages.length === 0) addSystem("还没有消息，说点什么吧。");
 
   historyLoading = false;
@@ -1021,10 +1039,12 @@ function onHistoryPage(messages, hasMore) {
   const anchor = $("loadMore") ? $("loadMore").nextSibling : list.firstChild;
   const frag = document.createDocumentFragment();
   messages.forEach((m) => {
-    frag.appendChild(buildMessage({
+    const li = buildMessage({
       id: m.id, name: m.name, text: m.text, created_at: m.created_at,
-      recalled: m.recalled, mine: m.mine, sameIp: (m.ip === myIp && m.name !== myName)
-    }));
+      recalled: m.recalled, mine: m.mine
+    });
+    if (m.mine) registerMine(m.id, li);
+    frag.appendChild(li);
   });
   list.insertBefore(frag, anchor);
 
@@ -1111,6 +1131,11 @@ function buildMessage(o) {
 
   bubble.appendChild(row);
   bubble.appendChild(body);
+  if (o.mine) {
+    const receipt = document.createElement("span");
+    receipt.className = "receipt";
+    bubble.appendChild(receipt);
+  }
   li.appendChild(bubble);
   return li;
 }
@@ -1144,14 +1169,10 @@ function onChat(msg) {
     return;
   }
   const mine = (msg.name === myName && msg.ip === myIp);
-  addMessage({
+  const li = addMessage({
     id: msg.id, name: msg.name, text: msg.text, created_at: msg.created_at, mine
   });
-
-  // 别人发来的新消息：不在底部时累加未读，顶部数字和横幅一起更新
-  if (!mine && msg.id > lastReadId && !nearBottom()) {
-    setUnread(unread + 1);
-  }
+  if (mine) registerMine(msg.id, li);
   bumpIfNotBottom();
 }
 
@@ -1221,6 +1242,7 @@ function confirmPending(cid, id) {
   item.status.textContent = "";
   ownSent.add(cid);      // 记住已确认的消息，广播回传时跳过
   pending.delete(cid);
+  registerMine(id, item.el);
   scrollToBottom();
 }
 
@@ -1265,10 +1287,13 @@ function onRecall(msg) {
 function onRoster(msg) {
   $("online").textContent = msg.online;
   ipMap.clear();
+  reads.clear();
   (msg.users || []).forEach((u) => {
     if (u.same_ip_as) ipMap.set(u.name, u.same_ip_as);
+    reads.set(u.name, u.last_read_id || 0);
   });
   refreshNotes();
+  refreshReceipts();
 }
 
 // 名单变了，已经显示的气泡也要跟着更新标记
@@ -1292,11 +1317,39 @@ function refreshNotes() {
   });
 }
 
-function setUnread(n) {
-  unread = n;
-  $("unread").textContent = n;
-  if (n > 0) {
-    $("bannerText").textContent = `你有 ${n} 条未读消息`;
+// 登记我发出的消息，用于计算「还有多少人没读」
+function registerMine(id, li) {
+  const num = Number(id);
+  if (!num) return;
+  myMsgs.set(num, li);
+  refreshReceipts();
+}
+
+// 刷新每条「我发的消息」的回执：在线的人里还有几个没读到这一条
+function refreshReceipts() {
+  const others = [];
+  reads.forEach((lastRead, name) => {
+    if (name !== myName) others.push(lastRead || 0);
+  });
+
+  myMsgs.forEach((li, id) => {
+    const el = li.querySelector(".receipt");
+    if (!el) return;
+    if (others.length === 0) {
+      el.textContent = "暂无其他人在线";
+      el.style.color = "";
+      return;
+    }
+    const unread = others.filter((r) => r < id).length;
+    el.textContent = unread > 0 ? `${unread} 人未读` : "全部已读";
+    el.style.color = unread > 0 ? "" : "#86efac";
+  });
+}
+
+// 横幅只作为「回到上次阅读位置」的入口，不再显示收件箱未读数
+function updateBanner() {
+  if (firstUnreadId) {
+    $("bannerText").textContent = "你上次看到这里";
     $("banner").classList.remove("hidden");
   } else {
     $("banner").classList.add("hidden");
@@ -1329,7 +1382,8 @@ function markAllRead() {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "read", last_message_id: id }));
   }
-  setUnread(0);
+  firstUnreadId = null;
+  updateBanner();
   const div = $("readDivider");
   if (div) div.remove();
 }
@@ -1392,7 +1446,6 @@ function jumpLatest() {
   newCount = 0;
   updateJump();
   maybeMarkRead();
-  setUnread(0);
 }
 
 function scrollToBottom(force) {
