@@ -727,6 +727,14 @@ PAGE = """
   #jump:hover{background:#1e40af}
   @media (max-width:790px){ #jump{right:16px} }
 
+  /* 轻量提示条 */
+  #toast{position:fixed;left:50%;bottom:132px;z-index:40;
+         transform:translateX(-50%) translateY(8px);
+         background:rgba(15,23,42,.92);color:#fff;font-size:13px;
+         padding:9px 16px;border-radius:10px;max-width:80vw;text-align:center;
+         opacity:0;pointer-events:none;transition:opacity .2s, transform .2s}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
   .inputbar{position:fixed;left:0;right:0;bottom:0;background:#fff;
             border-top:1px solid var(--line);padding:10px 16px;
             display:flex;gap:10px;max-width:760px;margin:0 auto;flex-wrap:wrap}
@@ -922,7 +930,7 @@ function live(msg) {
     case "system":    addSystem(msg.message); break;
     case "roster":    onRoster(msg); break;
     case "unread":    setUnread(msg.count); lastReadId = msg.last_read_id; break;
-    case "error":     showErr(msg.message); break;
+    case "error":     showErr(msg.message); toast(msg.message); break;
   }
 }
 
@@ -1088,7 +1096,12 @@ function buildMessage(o) {
     const btn = document.createElement("button");
     btn.className = "recall-btn";
     btn.textContent = "撤回";
-    btn.onclick = () => recall(o.id);
+    // 用 DOM 上的 id：发送中的消息 o.id 是空串，收到 ack 后才写进 dataset
+    btn.onclick = () => {
+      const id = li.dataset.id;
+      if (!id) { toast("这条消息还在发送中，稍后再撤"); return; }
+      recall(id);
+    };
     row.appendChild(btn);
   }
 
@@ -1134,6 +1147,11 @@ function onChat(msg) {
   addMessage({
     id: msg.id, name: msg.name, text: msg.text, created_at: msg.created_at, mine
   });
+
+  // 别人发来的新消息：不在底部时累加未读，顶部数字和横幅一起更新
+  if (!mine && msg.id > lastReadId && !nearBottom()) {
+    setUnread(unread + 1);
+  }
   bumpIfNotBottom();
 }
 
@@ -1226,8 +1244,10 @@ function onReject(msg) {
 
 /* ---------------- 撤回 ---------------- */
 function recall(id) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ type: "recall", id }));
+  const num = Number(id);
+  if (!num) { toast("这条消息还没有编号，无法撤回"); return; }
+  if (!ws || ws.readyState !== WebSocket.OPEN) { toast("连接已断开，稍后再试"); return; }
+  ws.send(JSON.stringify({ type: "recall", id: num }));
 }
 
 function onRecall(msg) {
@@ -1325,6 +1345,20 @@ function jumpToLastRead() {
 /* ---------------- 工具 ---------------- */
 function showErr(text) { $("err").textContent = text; }
 
+// 轻量提示条：撤回失败、发送被拒等短信息
+function toast(text) {
+  let el = $("toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "toast";
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.classList.add("show");
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => el.classList.remove("show"), 2800);
+}
+
 function nearBottom() {
   const list = $("list");
   return list.scrollTop + list.clientHeight >= list.scrollHeight - 60;
@@ -1358,6 +1392,7 @@ function jumpLatest() {
   newCount = 0;
   updateJump();
   maybeMarkRead();
+  setUnread(0);
 }
 
 function scrollToBottom(force) {
