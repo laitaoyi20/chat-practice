@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# 本地数据库（运行时生成，不进仓库）
+*.db
+*.db-wal
+*.db-shm
