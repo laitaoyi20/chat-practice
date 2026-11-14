@@ -52,6 +52,7 @@ MAX_TEXT = 500            # 单条消息最大字数
 MIN_INTERVAL = 0.4        # 两条消息最小间隔（秒），防刷屏
 RECALL_WINDOW = 300       # 撤回时限（秒）
 HISTORY_BATCH = 50        # 每次加载的历史条数（首次进入与「加载更多」共用）
+DUP_TEXT_WINDOW = 10      # 同一用户重发相同内容的拦截窗口（秒）
 MAX_NICK = 16             # 昵称最大长度
 
 
@@ -292,6 +293,9 @@ class Client:
 clients: dict[WebSocket, Client] = {}
 _seq = 0
 
+# 最近一次发送内容，用于「同一句话短时间内重复发送」的拦截
+_recent_text: dict[int, tuple[str, float]] = {}
+
 
 def next_seq() -> int:
     global _seq
@@ -453,12 +457,12 @@ async def handle_join(me: Client, data: dict) -> None:
     await send_history(me)
 
 
-async def reject_chat(me: Client, client_id: str | None, reason: str) -> None:
-    await me.ws.send_json({
-        "type": "reject",
-        "client_id": client_id,
-        "reason": reason,
-    })
+async def reject_chat(me: Client, client_id: str | None, reason: str,
+                      code: str | None = None) -> None:
+    payload = {"type": "reject", "client_id": client_id, "reason": reason}
+    if code:
+        payload["code"] = code
+    await me.ws.send_json(payload)
 
 
 async def handle_chat(me: Client, data: dict) -> None:
@@ -489,10 +493,22 @@ async def handle_chat(me: Client, data: dict) -> None:
         return
 
     now = time.time()
+
+    # 同一用户短时间内重复发送相同内容：拦下来并说明原因
+    prev = _recent_text.get(me.user_id)
+    if prev and prev[0] == text and now - prev[1] < DUP_TEXT_WINDOW:
+        await reject_chat(
+            me, client_id,
+            f"{DUP_TEXT_WINDOW} 秒内不要重复发送相同内容",
+            code="duplicate_text",
+        )
+        return
+
     if now - me.last_sent_at < MIN_INTERVAL:
         await reject_chat(me, client_id, "发送太快，请稍后再试")
         return
     me.last_sent_at = now
+    _recent_text[me.user_id] = (text, now)
 
     message_id, created_at, existed = insert_message(
         me.user_id, me.name, me.ip, text, client_id
@@ -587,6 +603,7 @@ def about() -> HTMLResponse:
       <li>在线人数按<b>不同 IP</b> 统计：同一 IP 开多个网页只算 1 人。</li>
       <li>进入需要昵称（1~16 字）；同 IP 用第二个昵称会先警告，确认后标记「和某某为同一 IP」。</li>
       <li>消息最长 500 字，两条之间至少间隔 0.4 秒。</li>
+      <li>同一句话在 10 秒内不要重复发送，否则会被拒绝并提示。</li>
       <li>只能撤回自己的消息，且必须在 5 分钟内；撤回后所有人看到「已撤回」。</li>
       <li>历史消息每次加载 50 条，可点「加载更早的消息」继续往前翻，直到最早一条。</li>
       <li>断线会自动重连；发送失败可点击「重试」，不会产生重复消息。</li>
@@ -1255,6 +1272,14 @@ function onReject(msg) {
   const item = pending.get(msg.client_id);
   if (!item) return;
   clearTimeout(item.timer);
+
+  // 重复内容：这条本来就不该发出去，直接撤掉气泡并提示
+  if (msg.code === "duplicate_text") {
+    item.el.remove();
+    pending.delete(msg.client_id);
+    toast(msg.reason);
+    return;
+  }
   item.status.className = "status fail";
   item.status.textContent = msg.reason || "发送失败";
   const btn = document.createElement("button");
