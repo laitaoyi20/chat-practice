@@ -300,13 +300,17 @@ def online_ip_count() -> int:
 
 
 def renormalize_ip(ip: str) -> None:
+    """某个 IP 的成员变动后，重算主账号与关联关系。
+
+    规则：该 IP 入场最早的人为主账号；同名成员视为本人多开，不标注关联。
+    """
     members = ip_members(ip)
     if not members:
         return
     primary = members[0]
     primary.same_ip_as = None
     for member in members[1:]:
-        member.same_ip_as = primary.name
+        member.same_ip_as = None if member.name == primary.name else primary.name
 
 
 # ---------------------------------------------------------------------------
@@ -361,33 +365,31 @@ async def send_history(me: Client) -> None:
 
 async def handle_join(me: Client, data: dict) -> None:
     """入场：昵称校验 → 同 IP 警告 → 建档 → 下发历史。"""
-    name = (data.get("name") or "").strip()[:MAX_NICK]
-    if not name:
+    raw = (data.get("name") or "").strip()
+    if not raw:
         await me.ws.send_json({"type": "reject", "reason": "昵称不能为空"})
         return
-    if len(name) > MAX_NICK:
+    if len(raw) > MAX_NICK:
         await me.ws.send_json({"type": "reject", "reason": f"昵称最多 {MAX_NICK} 个字"})
         return
-
-    # 同名重连（刷新/断线）视为同一个人：清掉旧连接
-    for other in [c for c in clients.values()
-                  if c.ip == me.ip and c.name == name and c.ws is not me.ws]:
-        clients.pop(other.ws, None)
+    name = raw
 
     members = ip_members(me.ip)
+    # 只有「名字不同」的同 IP 成员才需要警告；同名视为本人多开或刷新重连
+    others = [m for m in members if m.name != name]
 
-    if members and not data.get("confirm"):
+    if others and not data.get("confirm"):
         await me.ws.send_json({
             "type": "duplicate",
             "ip": me.ip,
-            "existing_name": members[0].name,
+            "existing_name": others[0].name,
             "online": online_ip_count(),
         })
         return
 
     me.name = name
     me.user_id = upsert_user(me.ip, name)
-    me.same_ip_as = members[0].name if members else None
+    me.same_ip_as = others[0].name if others else None
     renormalize_ip(me.ip)
 
     await me.ws.send_json({
@@ -720,6 +722,7 @@ let queue = [];
 let lastReadId = 0;
 let firstUnreadId = null;
 let unread = 0;
+let readArmed = false;      // 历史渲染后 2.5 秒才允许自动标已读，避免一进来就把未读清零
 let backoff = 2000;
 let lastSendAt = 0;
 const pending = new Map();     // client_id -> {el, text, id}
@@ -790,9 +793,16 @@ function handle(msg) {
   }
 
   if (msg.type === "duplicate") {
-    $("warnText").innerHTML =
-      `此网络（IP <b>${msg.ip}</b>）已有昵称「<b>${msg.existing_name}</b>」在线。<br>`
-      + `继续进入将以「${myName}」登录，并标记为「和 ${msg.existing_name} 为同一IP」。`;
+    // 用 DOM 拼装而不是 innerHTML：昵称是用户输入，直接拼 HTML 会有注入风险
+    const box = $("warnText");
+    box.textContent = "";
+    const bIp = document.createElement("b");
+    bIp.textContent = msg.ip;
+    const bName = document.createElement("b");
+    bName.textContent = msg.existing_name;
+    box.append("此网络（IP ", bIp, "）已有昵称「", bName, "」在线。");
+    box.appendChild(document.createElement("br"));
+    box.append(`继续进入将以「${myName}」登录，并标记为「和 ${msg.existing_name} 为同一IP」。`);
     $("warn").classList.remove("hidden");
     return;
   }
@@ -849,6 +859,10 @@ function renderHistory(messages, lastRead, unreadCount, limit) {
   const rest = queue; queue = [];
   rest.forEach(live);
   scrollToBottom(true);
+
+  // 给用户 2.5 秒看清未读和阅读位置，再允许自动标已读
+  readArmed = false;
+  setTimeout(() => { readArmed = true; }, 2500);
 }
 
 function insertDivider(beforeId) {
@@ -1059,7 +1073,7 @@ function maxMessageId() {
 }
 
 function maybeMarkRead() {
-  if (!joined || historyLoading) return;
+  if (!joined || historyLoading || !readArmed) return;
   const list = $("list");
   const atBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 40;
   if (!atBottom) return;
