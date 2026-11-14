@@ -13,3 +13,6 @@ wheels/
 *.db
 *.db-wal
 *.db-shm
+
+# 运行日志
+*.log
