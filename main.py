@@ -355,11 +355,13 @@ async def broadcast_system(message: str) -> None:
 
 
 async def broadcast_roster() -> None:
-    users = [
-        {"name": c.name, "ip": c.ip, "same_ip_as": c.same_ip_as}
-        for c in sorted(clients.values(), key=lambda c: c.seq)
-        if c.name
-    ]
+    seen: set[str] = set()
+    users = []
+    for c in sorted(clients.values(), key=lambda c: c.seq):
+        if not c.name or c.name in seen:
+            continue          # 同名只算一次（同一账号多开不重复出现在名单里）
+        seen.add(c.name)
+        users.append({"name": c.name, "ip": c.ip, "same_ip_as": c.same_ip_as})
     await broadcast({"type": "roster", "online": online_ip_count(), "users": users})
 
 
@@ -675,32 +677,55 @@ PAGE = """
                  padding:5px 10px;font-size:12px;cursor:pointer}
   #banner button.ghost{background:#fff;color:#1e40af;border:1px solid #bfdbfe}
 
-  #list{list-style:none;padding:12px;margin:12px 0 0;background:#fff;
-        border:1px solid var(--line);border-radius:10px;
-        height:min(62vh,540px);overflow-y:auto}
-  #list li{padding:6px 4px;font-size:14px;line-height:1.6;word-break:break-word}
-  #list li.sys{color:var(--muted);font-size:13px}
+  #list{list-style:none;padding:14px 12px;margin:12px 0 0;background:#f8fafc;
+        border:1px solid var(--line);border-radius:12px;
+        height:min(62vh,560px);overflow-y:auto}
+  #list li{font-size:14px;line-height:1.6;word-break:break-word}
+
+  /* 消息行：自己的靠右，别人的靠左 */
+  #list li.msg{display:flex;padding:5px 0}
+  #list li.msg.mine{justify-content:flex-end}
+
+  /* 气泡 */
+  .bubble{max-width:78%;padding:8px 12px;border-radius:14px;border:1px solid var(--line);
+          background:#fff;box-shadow:0 1px 2px rgba(15,23,42,.05)}
+  .mine .bubble{background:#2563eb;border-color:#1d4ed8;color:#fff;
+                border-bottom-right-radius:4px}
+  .other .bubble{border-bottom-left-radius:4px}
+  .mine .bubble .who,.mine .bubble .time{color:#dbeafe}
+  .mine .bubble .note{color:#fde68a}
+  .mine .bubble .recall-btn{color:#c7dcff}
+  .mine .bubble .recall-btn:hover{color:#fff}
+
+  #list li.sys{color:var(--muted);font-size:12px;text-align:center;padding:4px 0}
   .loadmore{text-align:center;padding:6px 0 10px}
   .loadmore button{border:1px solid var(--line);background:#fff;color:#1d4ed8;
                    border-radius:8px;padding:6px 14px;font-size:12px;cursor:pointer}
   .loadmore button:hover{border-color:#93c5fd}
   .loadmore button:disabled{color:#9aa5b1;cursor:not-allowed;border-color:var(--line)}
   .row{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
-  .who{font-weight:600;color:#1d4ed8}
-  .time{color:#9aa5b1;font-size:12px}
-  .note{color:#b45309;font-size:12px}
-  .body{margin-top:2px}
-  .mine .who{color:#047857}
-  .recalled .body{color:#9aa5b1;font-style:italic}
-  .status{font-size:12px;color:#9aa5b1}
-  .status.fail{color:#dc2626}
+  .who{font-weight:600;font-size:12.5px;color:#1d4ed8}
+  .time{color:#9aa5b1;font-size:11px}
+  .note{color:#b45309;font-size:11px}
+  .body{margin-top:2px;white-space:pre-wrap}
+  .recalled .body{opacity:.7;font-style:italic}
+  .status{display:block;font-size:11px;color:#cbd5e1;text-align:right;margin-top:2px}
+  .status.fail{color:#fca5a5}
   .retry{margin-left:6px;border:0;background:#fee2e2;color:#b91c1c;
-         border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer}
-  .recall-btn{border:0;background:none;color:#9aa5b1;font-size:12px;
-              cursor:pointer;padding:0 2px}
-  .recall-btn:hover{color:#dc2626}
-  .divider{color:#b45309;font-size:12px;text-align:center;transition:opacity .6s}
+         border-radius:6px;padding:2px 8px;font-size:11px;cursor:pointer}
+  .recall-btn{border:0;background:none;color:#9aa5b1;font-size:11px;
+              cursor:pointer;padding:0 2px;opacity:0;transition:opacity .15s}
+  li.msg:hover .recall-btn{opacity:1}
+  .divider{color:#b45309;font-size:12px;text-align:center;padding:6px 0;transition:opacity .6s}
   .fade{opacity:0}
+
+  /* 悬浮按钮：回到最新消息 */
+  #jump{position:fixed;bottom:84px;right:calc(50% - 372px);z-index:20;
+        border:0;border-radius:18px;padding:8px 14px;font-size:12px;font-weight:600;
+        background:#1d4ed8;color:#fff;cursor:pointer;
+        box-shadow:0 6px 18px rgba(29,78,216,.35)}
+  #jump:hover{background:#1e40af}
+  @media (max-width:790px){ #jump{right:16px} }
 
   .inputbar{position:fixed;left:0;right:0;bottom:0;background:#fff;
             border-top:1px solid var(--line);padding:10px 16px;
@@ -749,6 +774,8 @@ PAGE = """
 
   <ul id="list"></ul>
 
+  <button id="jump" class="hidden" onclick="jumpLatest()">↓ 新消息</button>
+
   <div class="inputbar">
     <div id="err"></div>
     <input id="text" placeholder="说点什么…" autocomplete="off" maxlength="600">
@@ -775,6 +802,9 @@ let loadingMore = false;
 let backoff = 2000;
 let lastSendAt = 0;
 const pending = new Map();     // client_id -> {el, text, id}
+const ownSent = new Set();     // 已确认的 client_id：广播回传时用它去重
+const ipMap = new Map();       // 昵称 -> 关联的同 IP 昵称
+let newCount = 0;              // 屏幕外的未读新消息数（悬浮按钮显示）
 const MAX_TEXT = 500;
 
 /* ---------------- 连接 ---------------- */
@@ -836,6 +866,7 @@ function handle(msg) {
     $("app").classList.remove("hidden");
     $("me").textContent = msg.name + (msg.same_ip_as ? `（和 ${msg.same_ip_as} 为同一IP）` : "");
     $("online").textContent = msg.online;
+    if (msg.same_ip_as) ipMap.set(msg.name, msg.same_ip_as);
     historyLoading = true;
     $("text").focus();
     return;
@@ -853,6 +884,12 @@ function handle(msg) {
     box.appendChild(document.createElement("br"));
     box.append(`继续进入将以「${myName}」登录，并标记为「和 ${msg.existing_name} 为同一IP」。`);
     $("warn").classList.remove("hidden");
+    return;
+  }
+
+  if (msg.type === "roster") {
+    // 名单要在渲染历史之前生效，否则历史里的「同 IP」标记会丢
+    onRoster(msg);
     return;
   }
 
@@ -883,7 +920,7 @@ function live(msg) {
     case "reject":    onReject(msg); break;
     case "recall":    onRecall(msg); break;
     case "system":    addSystem(msg.message); break;
-    case "roster":    $("online").textContent = msg.online; break;
+    case "roster":    onRoster(msg); break;
     case "unread":    setUnread(msg.count); lastReadId = msg.last_read_id; break;
     case "error":     showErr(msg.message); break;
   }
@@ -1005,11 +1042,25 @@ function insertDivider(beforeId) {
 }
 
 /* ---------------- 聊天消息 ---------------- */
+const PALETTE = ["#eef2ff", "#ecfdf5", "#fff7ed", "#f5f3ff",
+                 "#ecfeff", "#fdf2f8", "#fefce8", "#f0fdfa"];
+
+function colorFor(name) {
+  let h = 0;
+  for (const ch of String(name || "")) h = (h * 31 + ch.codePointAt(0)) % 9973;
+  return PALETTE[h % PALETTE.length];
+}
+
 function buildMessage(o) {
   const li = document.createElement("li");
+  li.className = "msg " + (o.mine ? "mine" : "other");
   li.dataset.id = o.id || "";
-  if (o.mine) li.classList.add("mine");
+  li.dataset.name = o.name || "";
   if (o.recalled) li.classList.add("recalled");
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  if (!o.mine) bubble.style.background = colorFor(o.name);   // 同一人固定同色
 
   const row = document.createElement("div");
   row.className = "row";
@@ -1024,10 +1075,12 @@ function buildMessage(o) {
   time.textContent = fmtTime(o.created_at);
   row.appendChild(time);
 
-  if (o.sameIp) {
+  // 同 IP 关联提示：对所有人生效（按昵称查关联表，而不是按自己的 IP 判断）
+  const linked = ipMap.get(o.name);
+  if (linked) {
     const note = document.createElement("span");
     note.className = "note";
-    note.textContent = "（和对方为同一 IP）";
+    note.textContent = `（和 ${linked} 为同一IP）`;
     row.appendChild(note);
   }
 
@@ -1043,8 +1096,9 @@ function buildMessage(o) {
   body.className = "body";
   body.textContent = o.recalled ? "该消息已撤回" : o.text;
 
-  li.appendChild(row);
-  li.appendChild(body);
+  bubble.appendChild(row);
+  bubble.appendChild(body);
+  li.appendChild(bubble);
   return li;
 }
 
@@ -1071,16 +1125,16 @@ function addSystem(text) {
 }
 
 function onChat(msg) {
-  if (msg.client_id && pending.has(msg.client_id)) {
-    confirmPending(msg.client_id, msg.id);
-    return;   // 自己发的消息：已经显示过，只更新状态
+  // 服务端会把消息广播回发送者本人：必须用 client_id 去重，否则自己看到两条
+  if (msg.client_id && (pending.has(msg.client_id) || ownSent.has(msg.client_id))) {
+    if (pending.has(msg.client_id)) confirmPending(msg.client_id, msg.id);
+    return;
   }
+  const mine = (msg.name === myName && msg.ip === myIp);
   addMessage({
-    id: msg.id, name: msg.name, text: msg.text, created_at: msg.created_at,
-    mine: msg.name === myName && msg.ip === myIp,
-    sameIp: (msg.ip === myIp && msg.name !== myName)
+    id: msg.id, name: msg.name, text: msg.text, created_at: msg.created_at, mine
   });
-  scrollToBottom();
+  bumpIfNotBottom();
 }
 
 /* ---------------- 发送 / 重试 ---------------- */
@@ -1103,13 +1157,15 @@ function send() {
   const status = document.createElement("span");
   status.className = "status";
   status.textContent = "发送中…";
-  li.appendChild(status);
+  const bubbleEl = li.querySelector(".bubble") || li;
+  bubbleEl.appendChild(status);
 
   pending.set(cid, { el: li, text, status });
   ws.send(JSON.stringify({ type: "chat", text, client_id: cid }));
   armTimeout(cid);
   box.value = "";
   box.focus();
+  scrollToBottom(true);
 }
 
 function armTimeout(cid) {
@@ -1145,6 +1201,7 @@ function confirmPending(cid, id) {
   clearTimeout(item.timer);
   item.el.dataset.id = id;
   item.status.textContent = "";
+  ownSent.add(cid);      // 记住已确认的消息，广播回传时跳过
   pending.delete(cid);
   scrollToBottom();
 }
@@ -1185,6 +1242,36 @@ function onRecall(msg) {
 }
 
 /* ---------------- 已读 / 未读 ---------------- */
+function onRoster(msg) {
+  $("online").textContent = msg.online;
+  ipMap.clear();
+  (msg.users || []).forEach((u) => {
+    if (u.same_ip_as) ipMap.set(u.name, u.same_ip_as);
+  });
+  refreshNotes();
+}
+
+// 名单变了，已经显示的气泡也要跟着更新标记
+function refreshNotes() {
+  $("list").querySelectorAll("li.msg").forEach((li) => {
+    const name = li.dataset.name;
+    const row = li.querySelector(".row");
+    if (!name || !row) return;
+    const linked = ipMap.get(name);
+    let note = row.querySelector(".note");
+    if (linked) {
+      if (!note) {
+        note = document.createElement("span");
+        note.className = "note";
+        row.appendChild(note);
+      }
+      note.textContent = `（和 ${linked} 为同一IP）`;
+    } else if (note) {
+      note.remove();
+    }
+  });
+}
+
 function setUnread(n) {
   unread = n;
   $("unread").textContent = n;
@@ -1238,13 +1325,52 @@ function jumpToLastRead() {
 /* ---------------- 工具 ---------------- */
 function showErr(text) { $("err").textContent = text; }
 
+function nearBottom() {
+  const list = $("list");
+  return list.scrollTop + list.clientHeight >= list.scrollHeight - 60;
+}
+
+function updateJump() {
+  const btn = $("jump");
+  if (!btn) return;
+  if (nearBottom()) {
+    btn.classList.add("hidden");
+    return;
+  }
+  btn.classList.remove("hidden");
+  btn.textContent = newCount > 0 ? `↓ 新消息 ${newCount}` : "↓ 到底部";
+}
+
+function bumpIfNotBottom() {
+  const list = $("list");
+  if (nearBottom()) {
+    list.scrollTop = list.scrollHeight;
+    newCount = 0;
+  } else {
+    newCount += 1;
+  }
+  updateJump();
+}
+
+function jumpLatest() {
+  const list = $("list");
+  list.scrollTop = list.scrollHeight;
+  newCount = 0;
+  updateJump();
+  maybeMarkRead();
+}
+
 function scrollToBottom(force) {
   const list = $("list");
-  const atBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 60;
-  if (force || atBottom) list.scrollTop = list.scrollHeight;
+  if (force || nearBottom()) {
+    list.scrollTop = list.scrollHeight;
+    newCount = 0;
+  }
+  updateJump();
 }
 
 $("list").addEventListener("scroll", () => {
+  updateJump();
   clearTimeout(window._readTimer);
   window._readTimer = setTimeout(maybeMarkRead, 500);
 });
