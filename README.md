@@ -14,7 +14,7 @@
 - **发送失败重试**：失败可点「重试」，同一条消息不会重复
 - **断线自动重连**：指数退避，最多 15 秒
 - **输入校验**：空消息、超 500 字、0.4 秒内连发都会被拒绝并提示原因
-- **历史消息**：新用户可读最近 30 条；加载期间的新消息排队后补
+- **历史消息**：每次加载 50 条；可点「加载更早的消息」反复往前翻，直到库中最早一条；加载期间的新消息排队后补
 
 **规则**
 
@@ -91,9 +91,10 @@ http://127.0.0.1:8000
   {"type":"chat",   "text":"你好", "client_id":"uuid"}
   {"type":"recall", "id":12}
   {"type":"read",   "last_message_id":12}
+  {"type":"history_more", "before_id":71}
 
 服务端 → 客户端
-  welcome / duplicate / history
+  welcome / duplicate / history / history_page
   chat / ack / reject / recall / system / roster / unread / error
 ```
 

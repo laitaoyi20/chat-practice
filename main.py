@@ -14,7 +14,8 @@ V3 功能：
     5. 连接状态提示与自动重连（指数退避）
     6. 未读数量显示 + 回到上次阅读位置（位置标记 6 秒后消失）
     7. 输入校验与可理解的拒绝提示
-    8. 新用户可阅读最近 30 条历史；加载历史期间的新消息排队稍后渲染
+    8. 历史消息每次加载 50 条，可反复「加载更早的消息」直到库中最早一条；
+       加载期间到达的新消息排队，渲染完再补
     9. 全部状态落在 SQLite（chat.db）
 
 数据表：
@@ -50,7 +51,7 @@ DB_PATH = Path(__file__).with_name("chat.db")
 MAX_TEXT = 500            # 单条消息最大字数
 MIN_INTERVAL = 0.4        # 两条消息最小间隔（秒），防刷屏
 RECALL_WINDOW = 300       # 撤回时限（秒）
-HISTORY_LIMIT = 30        # 新用户可读的历史条数
+HISTORY_BATCH = 50        # 每次加载的历史条数（首次进入与「加载更多」共用）
 MAX_NICK = 16             # 昵称最大长度
 
 
@@ -158,14 +159,33 @@ def find_by_client_id(user_id: int, client_id: str) -> tuple[int, float] | None:
         return int(row["id"]), float(row["created_at"])
 
 
-def fetch_history(limit: int, me_user_id: int) -> list[dict]:
-    """最近 limit 条消息，按时间正序返回。撤回的消息只给状态，不给原文。"""
+def fetch_history(limit: int, me_user_id: int, before_id: int | None = None) -> tuple[list[dict], bool]:
+    """取历史消息，正序返回，并告知是否还有更早的。
+
+    before_id 为空：取最近 limit 条。
+    before_id 有值：取 id 小于它的 limit 条（「加载更多」）。
+    撤回的消息只给状态，不给原文。
+    """
     with _lock:
-        rows = _conn.execute(
-            "SELECT id, user_id, name, ip, text, created_at, status"
-            " FROM messages ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        if before_id:
+            rows = _conn.execute(
+                "SELECT id, user_id, name, ip, text, created_at, status"
+                " FROM messages WHERE id < ? ORDER BY id DESC LIMIT ?",
+                (before_id, limit),
+            ).fetchall()
+        else:
+            rows = _conn.execute(
+                "SELECT id, user_id, name, ip, text, created_at, status"
+                " FROM messages ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+        has_more = False
+        if rows:
+            oldest = rows[-1]["id"]
+            has_more = _conn.execute(
+                "SELECT 1 FROM messages WHERE id < ? LIMIT 1", (oldest,)
+            ).fetchone() is not None
 
     out = []
     for row in reversed(rows):
@@ -179,7 +199,7 @@ def fetch_history(limit: int, me_user_id: int) -> list[dict]:
             "recalled": recalled,
             "mine": row["user_id"] == me_user_id,
         })
-    return out
+    return out, has_more
 
 
 def recall_message(message_id: int, user_id: int) -> tuple[bool, str]:
@@ -348,10 +368,10 @@ async def broadcast_roster() -> None:
 # ---------------------------------------------------------------------------
 
 async def send_history(me: Client) -> None:
-    """下发最近 30 条历史 + 已读位置 + 未读数。"""
+    """下发首批历史（最近 50 条）+ 已读位置 + 未读数 + 是否还有更早。"""
     me_user_id = me.user_id or 0
     last_read = get_last_read(me_user_id)
-    history = fetch_history(HISTORY_LIMIT, me_user_id)
+    history, has_more = fetch_history(HISTORY_BATCH, me_user_id)
     unread = count_unread(me_user_id, last_read)
 
     await me.ws.send_json({
@@ -359,7 +379,26 @@ async def send_history(me: Client) -> None:
         "messages": history,
         "last_read_id": last_read,
         "unread": unread,
-        "limit": HISTORY_LIMIT,
+        "has_more": has_more,
+        "batch": HISTORY_BATCH,
+    })
+
+
+async def handle_history_more(me: Client, data: dict) -> None:
+    """加载更多：取比 before_id 更早的 50 条，不改动已读位置。"""
+    if not me.user_id:
+        return
+    try:
+        before_id = int(data.get("before_id"))
+    except (TypeError, ValueError):
+        return
+
+    page, has_more = fetch_history(HISTORY_BATCH, me.user_id, before_id)
+    await me.ws.send_json({
+        "type": "history_page",
+        "messages": page,
+        "has_more": has_more,
+        "batch": HISTORY_BATCH,
     })
 
 
@@ -535,7 +574,7 @@ def about() -> HTMLResponse:
       <li>进入需要昵称（1~16 字）；同 IP 用第二个昵称会先警告，确认后标记「和某某为同一 IP」。</li>
       <li>消息最长 500 字，两条之间至少间隔 0.4 秒。</li>
       <li>只能撤回自己的消息，且必须在 5 分钟内；撤回后所有人看到「已撤回」。</li>
-      <li>新进入可查看最近 30 条历史；未读消息会标出上次阅读位置。</li>
+      <li>历史消息每次加载 50 条，可点「加载更早的消息」继续往前翻，直到最早一条。</li>
       <li>断线会自动重连；发送失败可点击「重试」，不会产生重复消息。</li>
     </ul>
     <p>在线人数接口：本页地址后加 <code>/health</code></p>
@@ -576,6 +615,8 @@ async def ws(websocket: WebSocket) -> None:
                 await handle_recall(me, data)
             elif kind == "read":
                 await handle_read(me, data)
+            elif kind == "history_more":
+                await handle_history_more(me, data)
 
     except WebSocketDisconnect:
         pass
@@ -639,6 +680,11 @@ PAGE = """
         height:min(62vh,540px);overflow-y:auto}
   #list li{padding:6px 4px;font-size:14px;line-height:1.6;word-break:break-word}
   #list li.sys{color:var(--muted);font-size:13px}
+  .loadmore{text-align:center;padding:6px 0 10px}
+  .loadmore button{border:1px solid var(--line);background:#fff;color:#1d4ed8;
+                   border-radius:8px;padding:6px 14px;font-size:12px;cursor:pointer}
+  .loadmore button:hover{border-color:#93c5fd}
+  .loadmore button:disabled{color:#9aa5b1;cursor:not-allowed;border-color:var(--line)}
   .row{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
   .who{font-weight:600;color:#1d4ed8}
   .time{color:#9aa5b1;font-size:12px}
@@ -723,6 +769,9 @@ let lastReadId = 0;
 let firstUnreadId = null;
 let unread = 0;
 let readArmed = false;      // 历史渲染后 2.5 秒才允许自动标已读，避免一进来就把未读清零
+let oldestId = null;        // 当前已加载的最早一条消息 id
+let hasMoreHistory = false; // 是否还有更早的消息
+let loadingMore = false;
 let backoff = 2000;
 let lastSendAt = 0;
 const pending = new Map();     // client_id -> {el, text, id}
@@ -808,7 +857,12 @@ function handle(msg) {
   }
 
   if (msg.type === "history") {
-    renderHistory(msg.messages, msg.last_read_id, msg.unread, msg.limit);
+    renderHistory(msg.messages, msg.last_read_id, msg.unread, msg.has_more, msg.batch);
+    return;
+  }
+
+  if (msg.type === "history_page") {
+    onHistoryPage(msg.messages, msg.has_more);
     return;
   }
 
@@ -836,24 +890,30 @@ function live(msg) {
 }
 
 /* ---------------- 历史渲染 ---------------- */
-function renderHistory(messages, lastRead, unreadCount, limit) {
+function renderHistory(messages, lastRead, unreadCount, hasMore, batch) {
   $("list").innerHTML = "";
   firstUnreadId = null;
   lastReadId = lastRead || 0;
+  hasMoreHistory = !!hasMore;
+  loadingMore = false;
+  ensureLoadMore(batch);
 
   messages.forEach((m) => {
-    const el = addMessage({
+    $("list").appendChild(buildMessage({
       id: m.id, name: m.name, text: m.text, created_at: m.created_at,
       recalled: m.recalled, mine: m.mine, sameIp: (m.ip === myIp && m.name !== myName)
-    });
+    }));
     if (!firstUnreadId && m.id > lastReadId && !m.mine) firstUnreadId = m.id;
   });
+
+  // 消息按 id 正序，第一条就是当前已加载的最早一条
+  oldestId = messages.length ? messages[0].id : null;
+  updateLoadMore(batch);
 
   if (firstUnreadId) insertDivider(firstUnreadId);
 
   setUnread(unreadCount || 0);
   if (messages.length === 0) addSystem("还没有消息，说点什么吧。");
-  else if (messages.length >= limit) addSystem(`以上为最近 ${limit} 条消息。`);
 
   historyLoading = false;
   const rest = queue; queue = [];
@@ -863,6 +923,71 @@ function renderHistory(messages, lastRead, unreadCount, limit) {
   // 给用户 2.5 秒看清未读和阅读位置，再允许自动标已读
   readArmed = false;
   setTimeout(() => { readArmed = true; }, 2500);
+}
+
+/* ---------------- 加载更多历史 ---------------- */
+function ensureLoadMore(batch) {
+  if ($("loadMore")) return;
+  const li = document.createElement("li");
+  li.id = "loadMore";
+  li.className = "loadmore";
+  const btn = document.createElement("button");
+  btn.id = "loadMoreBtn";
+  btn.onclick = loadMore;
+  btn.textContent = `加载更早的消息（${batch || 50} 条）`;
+  li.appendChild(btn);
+  $("list").prepend(li);
+}
+
+function updateLoadMore(batch) {
+  ensureLoadMore(batch);
+  const btn = $("loadMoreBtn");
+  if (!btn) return;
+  if (!oldestId) {
+    btn.textContent = "没有更早的消息";
+    btn.disabled = true;
+  } else if (!hasMoreHistory) {
+    btn.textContent = "已经到最早的消息了";
+    btn.disabled = true;
+  } else {
+    btn.textContent = `加载更早的消息（${batch || 50} 条）`;
+    btn.disabled = loadingMore;
+  }
+}
+
+function loadMore() {
+  if (loadingMore || !hasMoreHistory || !oldestId) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) { showErr("连接已断开，稍后再试"); return; }
+  loadingMore = true;
+  const btn = $("loadMoreBtn");
+  btn.textContent = "加载中…";
+  btn.disabled = true;
+  ws.send(JSON.stringify({ type: "history_more", before_id: oldestId }));
+}
+
+function onHistoryPage(messages, hasMore) {
+  loadingMore = false;
+  hasMoreHistory = !!hasMore;
+
+  const list = $("list");
+  const prevHeight = list.scrollHeight;
+  const prevTop = list.scrollTop;
+
+  const anchor = $("loadMore") ? $("loadMore").nextSibling : list.firstChild;
+  const frag = document.createDocumentFragment();
+  messages.forEach((m) => {
+    frag.appendChild(buildMessage({
+      id: m.id, name: m.name, text: m.text, created_at: m.created_at,
+      recalled: m.recalled, mine: m.mine, sameIp: (m.ip === myIp && m.name !== myName)
+    }));
+  });
+  list.insertBefore(frag, anchor);
+
+  if (messages.length) oldestId = messages[0].id;
+  updateLoadMore();
+
+  // 保持视觉位置不跳动：把新增的高度补到 scrollTop 上
+  list.scrollTop = prevTop + (list.scrollHeight - prevHeight);
 }
 
 function insertDivider(beforeId) {
@@ -880,7 +1005,7 @@ function insertDivider(beforeId) {
 }
 
 /* ---------------- 聊天消息 ---------------- */
-function addMessage(o) {
+function buildMessage(o) {
   const li = document.createElement("li");
   li.dataset.id = o.id || "";
   if (o.mine) li.classList.add("mine");
@@ -920,6 +1045,11 @@ function addMessage(o) {
 
   li.appendChild(row);
   li.appendChild(body);
+  return li;
+}
+
+function addMessage(o) {
+  const li = buildMessage(o);
   $("list").appendChild(li);
   return li;
 }
