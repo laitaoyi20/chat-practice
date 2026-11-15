@@ -48,6 +48,9 @@ app = FastAPI()
 
 DB_PATH = Path(__file__).with_name("chat.db")
 
+# 固定三个房间。房间之间数据完全隔离，互不可见
+ROOMS = ("茶室", "咖啡厅", "漫画工作室")
+
 MAX_TEXT = 500            # 单条消息最大字数
 MIN_INTERVAL = 0.4        # 两条消息最小间隔（秒），防刷屏
 RECALL_WINDOW = 300       # 撤回时限（秒）
@@ -63,15 +66,17 @@ MAX_NICK = 16             # 昵称最大长度
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    room         TEXT    NOT NULL,
     ip           TEXT    NOT NULL,
     name         TEXT    NOT NULL,
     created_at   REAL    NOT NULL,
     last_seen_at REAL    NOT NULL,
-    UNIQUE(ip, name)
+    UNIQUE(room, ip, name)
 );
 
 CREATE TABLE IF NOT EXISTS messages (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    room        TEXT    NOT NULL,
     user_id     INTEGER NOT NULL REFERENCES users(id),
     name        TEXT    NOT NULL,
     ip          TEXT    NOT NULL,
@@ -90,6 +95,7 @@ CREATE TABLE IF NOT EXISTS read_state (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_client
     ON messages(user_id, client_id) WHERE client_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_msg_room ON messages(room, id);
 CREATE INDEX IF NOT EXISTS idx_msg_id ON messages(id);
 """
 
@@ -101,26 +107,31 @@ _conn.executescript(SCHEMA)
 _conn.commit()
 
 
-def upsert_user(ip: str, name: str) -> int:
-    """按 (ip, name) 找用户，没有就建。返回 user_id。"""
+def upsert_user(room: str, ip: str, name: str) -> int:
+    """按 (房间, ip, 昵称) 找人，没有就建。返回 user_id。
+
+    同一个 IP + 昵称在不同房间里是两条独立档案，互不影响。
+    """
     now = time.time()
     with _lock:
         row = _conn.execute(
-            "SELECT id FROM users WHERE ip=? AND name=?", (ip, name)
+            "SELECT id FROM users WHERE room=? AND ip=? AND name=?",
+            (room, ip, name),
         ).fetchone()
         if row:
             _conn.execute("UPDATE users SET last_seen_at=? WHERE id=?", (now, row["id"]))
             _conn.commit()
             return row["id"]
         cur = _conn.execute(
-            "INSERT INTO users(ip,name,created_at,last_seen_at) VALUES(?,?,?,?)",
-            (ip, name, now, now),
+            "INSERT INTO users(room,ip,name,created_at,last_seen_at) VALUES(?,?,?,?,?)",
+            (room, ip, name, now, now),
         )
         _conn.commit()
         return int(cur.lastrowid)
 
 
-def insert_message(user_id: int, name: str, ip: str, text: str, client_id: str | None):
+def insert_message(room: str, user_id: int, name: str, ip: str, text: str,
+                   client_id: str | None):
     """写入一条消息。
 
     若同一 user 用同一 client_id 重复提交（网络重试），返回已存在的那条，
@@ -138,9 +149,9 @@ def insert_message(user_id: int, name: str, ip: str, text: str, client_id: str |
                 return int(row["id"]), float(row["created_at"]), True
 
         cur = _conn.execute(
-            "INSERT INTO messages(user_id,name,ip,text,created_at,status,client_id)"
-            " VALUES(?,?,?,?,?, 'active', ?)",
-            (user_id, name, ip, text, now, client_id),
+            "INSERT INTO messages(room,user_id,name,ip,text,created_at,status,client_id)"
+            " VALUES(?,?,?,?,?,?, 'active', ?)",
+            (room, user_id, name, ip, text, now, client_id),
         )
         _conn.commit()
         return int(cur.lastrowid), now, False
@@ -160,7 +171,8 @@ def find_by_client_id(user_id: int, client_id: str) -> tuple[int, float] | None:
         return int(row["id"]), float(row["created_at"])
 
 
-def fetch_history(limit: int, me_user_id: int, before_id: int | None = None) -> tuple[list[dict], bool]:
+def fetch_history(room: str, limit: int, me_user_id: int,
+                  before_id: int | None = None) -> tuple[list[dict], bool]:
     """取历史消息，正序返回，并告知是否还有更早的。
 
     before_id 为空：取最近 limit 条。
@@ -171,21 +183,22 @@ def fetch_history(limit: int, me_user_id: int, before_id: int | None = None) -> 
         if before_id:
             rows = _conn.execute(
                 "SELECT id, user_id, name, ip, text, created_at, status"
-                " FROM messages WHERE id < ? ORDER BY id DESC LIMIT ?",
-                (before_id, limit),
+                " FROM messages WHERE room=? AND id < ? ORDER BY id DESC LIMIT ?",
+                (room, before_id, limit),
             ).fetchall()
         else:
             rows = _conn.execute(
                 "SELECT id, user_id, name, ip, text, created_at, status"
-                " FROM messages ORDER BY id DESC LIMIT ?",
-                (limit,),
+                " FROM messages WHERE room=? ORDER BY id DESC LIMIT ?",
+                (room, limit),
             ).fetchall()
 
         has_more = False
         if rows:
             oldest = rows[-1]["id"]
             has_more = _conn.execute(
-                "SELECT 1 FROM messages WHERE id < ? LIMIT 1", (oldest,)
+                "SELECT 1 FROM messages WHERE room=? AND id < ? LIMIT 1",
+                (room, oldest),
             ).fetchone() is not None
 
     out = []
@@ -204,7 +217,11 @@ def fetch_history(limit: int, me_user_id: int, before_id: int | None = None) -> 
 
 
 def recall_message(message_id: int, user_id: int) -> tuple[bool, str]:
-    """撤回。返回 (是否成功, 失败原因)。"""
+    """撤回。返回 (是否成功, 失败原因)。
+
+    只按 user_id 校验：user_id 本身已经绑定了房间，
+    所以不同房间的消息不可能被误撤。
+    """
     with _lock:
         row = _conn.execute(
             "SELECT id, user_id, created_at, status FROM messages WHERE id=?",
@@ -259,19 +276,21 @@ def set_last_read(user_id: int, message_id: int) -> int:
     return message_id
 
 
-def count_unread(user_id: int, last_read_id: int) -> int:
+def count_unread(room: str, user_id: int, last_read_id: int) -> int:
     with _lock:
         row = _conn.execute(
             "SELECT COUNT(*) AS n FROM messages"
-            " WHERE id > ? AND user_id != ? AND status = 'active'",
-            (last_read_id, user_id),
+            " WHERE room=? AND id > ? AND user_id != ? AND status = 'active'",
+            (room, last_read_id, user_id),
         ).fetchone()
         return int(row["n"])
 
 
-def count_messages() -> int:
+def count_messages(room: str) -> int:
     with _lock:
-        row = _conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()
+        row = _conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE room=?", (room,)
+        ).fetchone()
         return int(row["n"])
 
 
@@ -288,6 +307,7 @@ class Client:
     user_id: int | None = None
     same_ip_as: str | None = None
     last_sent_at: float = 0.0
+    room: str | None = None
 
 
 clients: dict[WebSocket, Client] = {}
@@ -312,23 +332,25 @@ def normalize_ip(raw: str | None) -> str:
     return ip
 
 
-def ip_members(ip: str) -> list[Client]:
+def ip_members(room: str, ip: str) -> list[Client]:
+    """同一房间内、同一 IP 下已入场的成员。"""
     return sorted(
-        (c for c in clients.values() if c.ip == ip and c.name),
+        (c for c in clients.values() if c.room == room and c.ip == ip and c.name),
         key=lambda c: c.seq,
     )
 
 
-def online_ip_count() -> int:
-    return len({c.ip for c in clients.values() if c.name})
+def online_ip_count(room: str) -> int:
+    """某房间的在线人数：按 IP 去重。"""
+    return len({c.ip for c in clients.values() if c.name and c.room == room})
 
 
-def renormalize_ip(ip: str) -> None:
+def renormalize_ip(room: str, ip: str) -> None:
     """某个 IP 的成员变动后，重算主账号与关联关系。
 
     规则：该 IP 入场最早的人为主账号；同名成员视为本人多开，不标注关联。
     """
-    members = ip_members(ip)
+    members = ip_members(room, ip)
     if not members:
         return
     primary = members[0]
@@ -341,10 +363,11 @@ def renormalize_ip(ip: str) -> None:
 # 广播
 # ---------------------------------------------------------------------------
 
-async def broadcast(payload: dict) -> None:
+async def broadcast(room: str, payload: dict) -> None:
+    """只发给同一房间的人。房间之间完全隔离。"""
     dead: list[Client] = []
     for client in list(clients.values()):
-        if not client.name:
+        if not client.name or client.room != room:
             continue
         try:
             await client.ws.send_json(payload)
@@ -354,16 +377,16 @@ async def broadcast(payload: dict) -> None:
         clients.pop(client.ws, None)
 
 
-async def broadcast_system(message: str) -> None:
-    await broadcast({"type": "system", "message": message})
+async def broadcast_system(room: str, message: str) -> None:
+    await broadcast(room, {"type": "system", "message": message})
 
 
-async def broadcast_roster() -> None:
+async def broadcast_roster(room: str) -> None:
     seen: set[str] = set()
     users = []
     for c in sorted(clients.values(), key=lambda c: c.seq):
-        if not c.name or c.name in seen:
-            continue          # 同名只算一次（同一账号多开不重复出现在名单里）
+        if not c.name or c.room != room or c.name in seen:
+            continue          # 只看本房间；同名只算一次
         seen.add(c.name)
         uid = c.user_id or 0
         users.append({
@@ -372,7 +395,8 @@ async def broadcast_roster() -> None:
             "same_ip_as": c.same_ip_as,
             "last_read_id": get_last_read(uid) if uid else 0,
         })
-    await broadcast({"type": "roster", "online": online_ip_count(), "users": users})
+    await broadcast(room, {"type": "roster", "online": online_ip_count(room),
+                           "users": users, "room": room})
 
 
 # ---------------------------------------------------------------------------
@@ -382,9 +406,10 @@ async def broadcast_roster() -> None:
 async def send_history(me: Client) -> None:
     """下发首批历史（最近 50 条）+ 已读位置 + 未读数 + 是否还有更早。"""
     me_user_id = me.user_id or 0
+    room = me.room or ROOMS[0]
     last_read = get_last_read(me_user_id)
-    history, has_more = fetch_history(HISTORY_BATCH, me_user_id)
-    unread = count_unread(me_user_id, last_read)
+    history, has_more = fetch_history(room, HISTORY_BATCH, me_user_id)
+    unread = count_unread(room, me_user_id, last_read)
 
     await me.ws.send_json({
         "type": "history",
@@ -405,7 +430,8 @@ async def handle_history_more(me: Client, data: dict) -> None:
     except (TypeError, ValueError):
         return
 
-    page, has_more = fetch_history(HISTORY_BATCH, me.user_id, before_id)
+    page, has_more = fetch_history(me.room or ROOMS[0], HISTORY_BATCH,
+                                   me.user_id, before_id)
     await me.ws.send_json({
         "type": "history_page",
         "messages": page,
@@ -415,45 +441,54 @@ async def handle_history_more(me: Client, data: dict) -> None:
 
 
 async def handle_join(me: Client, data: dict) -> None:
-    """入场：昵称校验 → 同 IP 警告 → 建档 → 下发历史。"""
+    """入场：校验昵称与房间 → 同 IP 警告（同房间内）→ 建档 → 下发本房间历史。"""
     raw = (data.get("name") or "").strip()
+    room = (data.get("room") or "").strip()
+
     if not raw:
         await me.ws.send_json({"type": "reject", "reason": "昵称不能为空"})
         return
     if len(raw) > MAX_NICK:
         await me.ws.send_json({"type": "reject", "reason": f"昵称最多 {MAX_NICK} 个字"})
         return
-    name = raw
+    if room not in ROOMS:
+        await me.ws.send_json({"type": "reject", "reason": "请选择一个有效的聊天室"})
+        return
 
-    members = ip_members(me.ip)
-    # 只有「名字不同」的同 IP 成员才需要警告；同名视为本人多开或刷新重连
+    name = raw
+    me.room = room
+
+    # 同 IP 警告只在同一房间内判断
+    members = ip_members(room, me.ip)
     others = [m for m in members if m.name != name]
 
     if others and not data.get("confirm"):
         await me.ws.send_json({
             "type": "duplicate",
             "ip": me.ip,
+            "room": room,
             "existing_name": others[0].name,
-            "online": online_ip_count(),
+            "online": online_ip_count(room),
         })
         return
 
     me.name = name
-    me.user_id = upsert_user(me.ip, name)
+    me.user_id = upsert_user(room, me.ip, name)
     me.same_ip_as = others[0].name if others else None
-    renormalize_ip(me.ip)
+    renormalize_ip(room, me.ip)
 
     await me.ws.send_json({
         "type": "welcome",
         "name": me.name,
         "ip": me.ip,
+        "room": room,
         "same_ip_as": me.same_ip_as,
-        "online": online_ip_count(),
+        "online": online_ip_count(room),
     })
 
     suffix = f"（和 {me.same_ip_as} 为同一 IP）" if me.same_ip_as else ""
-    await broadcast_system(f"{me.name} 加入了聊天室{suffix}")
-    await broadcast_roster()
+    await broadcast_system(room, f"{me.name} 加入了{room}{suffix}")
+    await broadcast_roster(room)
     await send_history(me)
 
 
@@ -511,7 +546,7 @@ async def handle_chat(me: Client, data: dict) -> None:
     _recent_text[me.user_id] = (text, now)
 
     message_id, created_at, existed = insert_message(
-        me.user_id, me.name, me.ip, text, client_id
+        me.room or ROOMS[0], me.user_id, me.name, me.ip, text, client_id
     )
 
     await me.ws.send_json({
@@ -524,7 +559,7 @@ async def handle_chat(me: Client, data: dict) -> None:
     if existed:
         return   # 重试导致重复提交：只回 ack，不再广播
 
-    await broadcast({
+    await broadcast(me.room or ROOMS[0], {
         "type": "chat",
         "id": message_id,
         "client_id": client_id,
@@ -551,7 +586,8 @@ async def handle_recall(me: Client, data: dict) -> None:
         await me.ws.send_json({"type": "error", "message": f"撤回失败：{reason}"})
         return
 
-    await broadcast({"type": "recall", "id": message_id, "by": me.name})
+    await broadcast(me.room or ROOMS[0],
+                    {"type": "recall", "id": message_id, "by": me.name})
 
 
 async def handle_read(me: Client, data: dict) -> None:
@@ -565,11 +601,11 @@ async def handle_read(me: Client, data: dict) -> None:
     last_read = set_last_read(me.user_id, message_id)
     await me.ws.send_json({
         "type": "unread",
-        "count": count_unread(me.user_id, last_read),
+        "count": count_unread(me.room or ROOMS[0], me.user_id, last_read),
         "last_read_id": last_read,
     })
     # 告诉所有人：这个人读到了哪一条
-    await broadcast({
+    await broadcast(me.room or ROOMS[0], {
         "type": "read_update",
         "name": me.name,
         "last_read_id": last_read,
@@ -582,12 +618,16 @@ async def handle_read(me: Client, data: dict) -> None:
 
 @app.get("/health")
 def health() -> dict:
-    return {
-        "ok": True,
-        "online": online_ip_count(),
-        "connections": len([c for c in clients.values() if c.name]),
-        "messages": count_messages(),
-    }
+    """按房间分别汇报在线人数与消息数。"""
+    rooms = {}
+    for room in ROOMS:
+        rooms[room] = {
+            "online": online_ip_count(room),
+            "connections": len([c for c in clients.values()
+                                if c.name and c.room == room]),
+            "messages": count_messages(room),
+        }
+    return {"ok": True, "rooms": rooms}
 
 
 @app.get("/")
@@ -654,10 +694,10 @@ async def ws(websocket: WebSocket) -> None:
 
     finally:
         clients.pop(websocket, None)
-        if me.name:
-            renormalize_ip(me.ip)
-            await broadcast_system(f"{me.name} 离开了聊天室")
-            await broadcast_roster()
+        if me.name and me.room:
+            renormalize_ip(me.room, me.ip)
+            await broadcast_system(me.room, f"{me.name} 离开了{me.room}")
+            await broadcast_roster(me.room)
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +731,16 @@ PAGE = """
   .warn{margin-top:14px;padding:12px;border-radius:8px;font-size:13px;line-height:1.6;
         background:#fff7ed;border:1px solid #fed7aa;color:#9a3412}
   .warn button{background:#ea580c}
+
+  /* 房间选择 */
+  .rooms{display:flex;flex-direction:column;gap:9px;margin-bottom:12px}
+  .room{padding:13px 14px;border:1px solid var(--line);border-radius:10px;
+        background:#fff;font-size:15px;cursor:pointer;text-align:left;color:#1f2933}
+  .room:hover{border-color:#93c5fd;background:#f0f7ff}
+  .card .ghost{background:#fff;color:#475569;border:1px solid var(--line)}
+  #leaveBtn{border:1px solid var(--line);background:#fff;color:#475569;
+            border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer}
+  #leaveBtn:hover{border-color:#93c5fd;color:#1d4ed8}
 
   #app{max-width:760px;margin:0 auto;padding:14px 16px 88px}
   header{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline}
@@ -784,12 +834,25 @@ PAGE = """
 <div id="join">
   <div class="card">
     <h2>进入聊天室</h2>
-    <p class="hint">输入昵称（1~16 字）。同一网络（IP）用第二个昵称会先警告，确认后标记「和某某为同一 IP」。</p>
-    <input id="name" maxlength="16" placeholder="你的昵称" autocomplete="off">
-    <button onclick="doJoin(false)">进入</button>
+    <p class="hint" id="joinHint">第一步：给自己起个昵称（1~16 字）</p>
+
+    <div id="stepName">
+      <input id="name" maxlength="16" placeholder="你的昵称" autocomplete="off">
+      <button onclick="gotoRooms()">下一步</button>
+    </div>
+
+    <div id="stepRoom" class="hidden">
+      <div class="rooms">
+        <button class="room" data-room="茶室" onclick="pickRoom(this)">茶室</button>
+        <button class="room" data-room="咖啡厅" onclick="pickRoom(this)">咖啡厅</button>
+        <button class="room" data-room="漫画工作室" onclick="pickRoom(this)">漫画工作室</button>
+      </div>
+      <button class="ghost" onclick="backToName()">← 返回上一步</button>
+    </div>
+
     <div id="warn" class="warn hidden">
       <div id="warnText"></div>
-      <button onclick="doJoin(true)">仍然进入</button>
+      <button onclick="confirmJoin()">仍然进入</button>
     </div>
   </div>
 </div>
@@ -798,8 +861,10 @@ PAGE = """
   <header>
     <h1>第4组聊天室</h1>
     <div class="meta">
+      <span>房间：<b id="room">-</b></span>
       <span>我：<b id="me">-</b></span>
       <span>在线：<b id="online">0</b> 人</span>
+      <button id="leaveBtn" onclick="switchRoom()">换房间</button>
       <span id="conn">正在连接…</span>
     </div>
   </header>
@@ -826,6 +891,8 @@ const $ = (id) => document.getElementById(id);
 
 let ws = null;
 let myName = null;
+let myRoom = null;
+let pendingRoom = null;
 let myIp = null;
 let joined = false;
 let historyLoading = false;
@@ -857,7 +924,7 @@ function connect() {
     setConn("已连接", "#15803d");
     $("sendBtn").disabled = false;
     $("text").disabled = false;
-    if (myName) sendJoin(myName, true);   // 断线重连后自动归位
+    if (myName && myRoom) sendJoin(myName, myRoom, true);   // 断线重连后自动归位
   };
 
   ws.onclose = () => {
@@ -878,18 +945,45 @@ function setConn(text, color) {
   $("conn").style.color = color;
 }
 
-/* ---------------- 入场 ---------------- */
-function sendJoin(name, confirm) {
-  ws.send(JSON.stringify({ type: "join", name, confirm: !!confirm }));
+/* ---------------- 入场：昵称 → 选房间 ---------------- */
+function sendJoin(name, room, confirm) {
+  ws.send(JSON.stringify({ type: "join", name, room, confirm: !!confirm }));
 }
 
-function doJoin(confirm) {
+function gotoRooms() {
   const name = $("name").value.trim();
   if (!name) { warn("昵称不能为空"); return; }
   if (name.length > 16) { warn("昵称最多 16 个字"); return; }
   myName = name;
+  $("warn").classList.add("hidden");
+  $("joinHint").textContent = "第二步：选择要进入的聊天室";
+  $("stepName").classList.add("hidden");
+  $("stepRoom").classList.remove("hidden");
+}
+
+function backToName() {
+  $("warn").classList.add("hidden");
+  $("joinHint").textContent = "第一步：给自己起个昵称（1~16 字）";
+  $("stepRoom").classList.add("hidden");
+  $("stepName").classList.remove("hidden");
+  $("name").focus();
+}
+
+function pickRoom(btn) {
   if (!ws || ws.readyState !== WebSocket.OPEN) { warn("还没连上服务器，请稍候"); return; }
-  sendJoin(name, confirm);
+  pendingRoom = btn.dataset.room;
+  $("warn").classList.add("hidden");
+  sendJoin(myName, pendingRoom, false);
+}
+
+function confirmJoin() {
+  if (!pendingRoom) return;
+  sendJoin(myName, pendingRoom, true);
+}
+
+// 换房间：整页重来，回到第一步
+function switchRoom() {
+  location.reload();
 }
 
 function warn(text) {
@@ -902,6 +996,8 @@ function handle(msg) {
   if (msg.type === "welcome") {
     joined = true;
     myIp = msg.ip;
+    myRoom = msg.room;
+    $("room").textContent = msg.room;
     $("join").classList.add("hidden");
     $("app").classList.remove("hidden");
     $("me").textContent = msg.name + (msg.same_ip_as ? `（和 ${msg.same_ip_as} 为同一IP）` : "");
@@ -920,7 +1016,7 @@ function handle(msg) {
     bIp.textContent = msg.ip;
     const bName = document.createElement("b");
     bName.textContent = msg.existing_name;
-    box.append("此网络（IP ", bIp, "）已有昵称「", bName, "」在线。");
+    box.append(`「${msg.room}」里（IP `, bIp, "）已有昵称「", bName, "」在线。");
     box.appendChild(document.createElement("br"));
     box.append(`继续进入将以「${myName}」登录，并标记为「和 ${msg.existing_name} 为同一IP」。`);
     $("warn").classList.remove("hidden");
