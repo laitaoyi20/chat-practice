@@ -632,7 +632,12 @@ def health() -> dict:
 
 @app.get("/")
 def home() -> HTMLResponse:
-    return HTMLResponse(PAGE)
+    """渲染页面时按 ROOMS 生成房间按钮 —— 加房间只需要改 ROOMS 一处。"""
+    buttons = "".join(
+        f'<button class="room" data-room="{room}" onclick="pickRoom(this)">{room}</button>'
+        for room in ROOMS
+    )
+    return HTMLResponse(PAGE.replace("<!--ROOM_BUTTONS-->", buttons))
 
 
 @app.get("/about")
@@ -843,9 +848,7 @@ PAGE = """
 
     <div id="stepRoom" class="hidden">
       <div class="rooms">
-        <button class="room" data-room="茶室" onclick="pickRoom(this)">茶室</button>
-        <button class="room" data-room="咖啡厅" onclick="pickRoom(this)">咖啡厅</button>
-        <button class="room" data-room="漫画工作室" onclick="pickRoom(this)">漫画工作室</button>
+        <!--ROOM_BUTTONS-->
       </div>
       <button class="ghost" onclick="backToName()">← 返回上一步</button>
     </div>
