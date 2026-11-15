@@ -955,15 +955,27 @@ function gotoRooms() {
   if (!name) { warn("昵称不能为空"); return; }
   if (name.length > 16) { warn("昵称最多 16 个字"); return; }
   myName = name;
+  localStorage.setItem("chat.nick", name);      // 记住昵称，换房间不用重输
   $("warn").classList.add("hidden");
-  $("joinHint").textContent = "第二步：选择要进入的聊天室";
+  $("joinHint").textContent = `第二步：选择要进入的聊天室（昵称：${name}）`;
   $("stepName").classList.add("hidden");
   $("stepRoom").classList.remove("hidden");
 }
 
+// 页面加载时恢复上次的昵称，直接停在「选房间」这一步
+function restoreNickname() {
+  const saved = localStorage.getItem("chat.nick");
+  if (!saved) return;
+  myName = saved;
+  $("name").value = saved;
+  $("stepName").classList.add("hidden");
+  $("stepRoom").classList.remove("hidden");
+  $("joinHint").textContent = `第二步：选择要进入的聊天室（昵称：${saved}）`;
+}
+
 function backToName() {
   $("warn").classList.add("hidden");
-  $("joinHint").textContent = "第一步：给自己起个昵称（1~16 字）";
+  $("joinHint").textContent = "第一步：给自己起个昵称（1~16 字，换房间不用改）";
   $("stepRoom").classList.add("hidden");
   $("stepName").classList.remove("hidden");
   $("name").focus();
@@ -981,7 +993,7 @@ function confirmJoin() {
   sendJoin(myName, pendingRoom, true);
 }
 
-// 换房间：整页重来，回到第一步
+// 换房间：刷新页面。昵称存在浏览器里，刷新后会直接停在「选房间」这一步
 function switchRoom() {
   location.reload();
 }
@@ -1587,6 +1599,7 @@ $("list").addEventListener("scroll", () => {
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 $("name").addEventListener("keydown", (e) => { if (e.key === "Enter") doJoin(false); });
 
+restoreNickname();
 connect();
 </script>
 </body>
