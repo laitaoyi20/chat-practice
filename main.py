@@ -693,10 +693,24 @@ def icon_bytes(size: int) -> bytes:
 @app.get("/icon-{size}.png")
 def icon(size: int) -> Response:
     """桌面图标。允许 180 / 192 / 512，其余按 192 处理。"""
-    if size not in (180, 192, 512):
+    if size not in (64, 180, 192, 512):
         size = 192
     return Response(
         content=icon_bytes(size),
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/favicon.ico")
+def favicon() -> Response:
+    """网站图标。
+
+    安卓「添加到主屏幕」的快捷方式优先取 favicon，
+    没有的话就会显示成浏览器默认图标 —— 所以这个必须有。
+    """
+    return Response(
+        content=icon_bytes(64),
         media_type="image/png",
         headers={"Cache-Control": "public, max-age=86400"},
     )
@@ -707,8 +721,8 @@ def manifest() -> JSONResponse:
     """PWA 清单：手机“添加到主屏幕”时读取。"""
     return JSONResponse(
         {
-            "name": "第4组聊天室",
-            "short_name": "聊天室",
+            "name": "域网聊天室",
+            "short_name": "域网聊天室",
             "description": "局域网多房间实时聊天",
             "start_url": "/",
             "scope": "/",
@@ -826,14 +840,16 @@ PAGE = """
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>第4组聊天室</title>
+<title>域网聊天室</title>
 
 <!-- 手机添加到桌面（PWA） -->
 <meta name="theme-color" content="#2563eb">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="第4组聊天室">
+<meta name="apple-mobile-web-app-title" content="域网聊天室">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="shortcut icon" href="/icon-192.png">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icon-180.png">
 <style>
@@ -993,7 +1009,7 @@ PAGE = """
 
 <div id="app" class="hidden">
   <header>
-    <h1>第4组聊天室</h1>
+    <h1>域网聊天室</h1>
     <div class="meta">
       <span>房间：<b id="room">-</b></span>
       <span>我：<b id="me">-</b></span>
