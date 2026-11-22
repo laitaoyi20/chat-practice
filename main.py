@@ -384,18 +384,23 @@ async def broadcast_system(room: str, message: str) -> None:
 
 
 async def broadcast_roster(room: str) -> None:
-    seen: set[str] = set()
+    # 按 user_id 去重：同一账号多开只出现一次；
+    # 同名但不同 IP 是两个人，各自保留一条
+    seen: set[int] = set()
     users = []
     for c in sorted(clients.values(), key=lambda c: c.seq):
-        if not c.name or c.room != room or c.name in seen:
-            continue          # 只看本房间；同名只算一次
-        seen.add(c.name)
+        if not c.name or c.room != room:
+            continue
         uid = c.user_id or 0
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
         users.append({
+            "user_id": uid,
             "name": c.name,
             "ip": c.ip,
             "same_ip_as": c.same_ip_as,
-            "last_read_id": get_last_read(uid) if uid else 0,
+            "last_read_id": get_last_read(uid),
         })
     await broadcast(room, {"type": "roster", "online": online_ip_count(room),
                            "users": users, "room": room})
@@ -482,6 +487,7 @@ async def handle_join(me: Client, data: dict) -> None:
     await me.ws.send_json({
         "type": "welcome",
         "name": me.name,
+        "user_id": me.user_id,
         "ip": me.ip,
         "room": room,
         "same_ip_as": me.same_ip_as,
@@ -609,6 +615,7 @@ async def handle_read(me: Client, data: dict) -> None:
     # 告诉所有人：这个人读到了哪一条
     await broadcast(me.room or ROOMS[0], {
         "type": "read_update",
+        "user_id": me.user_id,
         "name": me.name,
         "last_read_id": last_read,
     })
@@ -1041,6 +1048,7 @@ const $ = (id) => document.getElementById(id);
 
 let ws = null;
 let myName = null;
+let myUserId = null;
 let myRoom = null;
 let pendingRoom = null;
 let myIp = null;
@@ -1158,6 +1166,7 @@ function handle(msg) {
   if (msg.type === "welcome") {
     joined = true;
     myIp = msg.ip;
+    myUserId = msg.user_id;
     myRoom = msg.room;
     $("room").textContent = msg.room;
     $("join").classList.add("hidden");
@@ -1220,7 +1229,10 @@ function live(msg) {
     case "system":    addSystem(msg.message); break;
     case "roster":    onRoster(msg); break;
     case "unread":      lastReadId = msg.last_read_id; break;
-    case "read_update": reads.set(msg.name, msg.last_read_id); refreshReceipts(); break;
+    case "read_update":
+      if (msg.user_id) reads.set(msg.user_id, msg.last_read_id);
+      refreshReceipts();
+      break;
     case "error":     showErr(msg.message); toast(msg.message); break;
   }
 }
@@ -1573,7 +1585,8 @@ function onRoster(msg) {
   reads.clear();
   (msg.users || []).forEach((u) => {
     if (u.same_ip_as) ipMap.set(u.name, u.same_ip_as);
-    reads.set(u.name, u.last_read_id || 0);
+    // 用 user_id 当键：同名不同设备是两个人，不能互相覆盖
+    reads.set(u.user_id, u.last_read_id || 0);
   });
   refreshNotes();
   refreshReceipts();
@@ -1611,8 +1624,8 @@ function registerMine(id, li) {
 // 刷新每条「我发的消息」的回执：在线的人里还有几个没读到这一条
 function refreshReceipts() {
   const others = [];
-  reads.forEach((lastRead, name) => {
-    if (name !== myName) others.push(lastRead || 0);
+  reads.forEach((lastRead, uid) => {
+    if (uid !== myUserId) others.push(lastRead || 0);
   });
 
   myMsgs.forEach((li, id) => {
