@@ -32,13 +32,15 @@ V3 功能：
 
 import json
 import sqlite3
+import struct
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
 
 app = FastAPI()
 
@@ -616,6 +618,115 @@ async def handle_read(me: Client, data: dict) -> None:
 # HTTP 路由
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# PWA：图标与 manifest
+# ---------------------------------------------------------------------------
+
+_icon_cache: dict[int, bytes] = {}
+
+
+def _in_round_rect(x: float, y: float, x0: float, y0: float,
+                   x1: float, y1: float, r: float) -> bool:
+    if x < x0 or x > x1 or y < y0 or y > y1:
+        return False
+    cx = min(max(x, x0 + r), x1 - r)
+    cy = min(max(y, y0 + r), y1 - r)
+    return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+
+
+def _build_icon(size: int) -> bytes:
+    """用纯 Python 画一张 PNG：蓝底圆角方块 + 白色对话气泡。
+
+    不依赖 Pillow，避免为了一个图标多加一个库。
+    """
+    BG = (37, 99, 235, 255)      # #2563eb
+    FG = (255, 255, 255, 255)
+    CLEAR = (0, 0, 0, 0)
+
+    s = float(size)
+    rows = []
+    for y in range(size):
+        row = []
+        for x in range(size):
+            fx, fy = x + 0.5, y + 0.5
+
+            # 外框：圆角方块
+            if not _in_round_rect(fx, fy, 0, 0, s, s, s * 0.22):
+                row.append(CLEAR)
+                continue
+
+            # 气泡主体
+            if _in_round_rect(fx, fy, s * 0.20, s * 0.24, s * 0.80, s * 0.62, s * 0.09):
+                row.append(FG)
+                continue
+
+            # 气泡尾巴（左下角的小三角）
+            tx0, ty0 = s * 0.30, s * 0.62
+            if ty0 <= fy <= s * 0.74 and tx0 <= fx <= tx0 + (s * 0.74 - fy) * 1.6:
+                row.append(FG)
+                continue
+
+            row.append(BG)
+        rows.append(row)
+
+    raw = b"".join(
+        b"\x00" + b"".join(bytes(px) for px in row) for row in rows
+    )
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    header = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b""))
+
+
+def icon_bytes(size: int) -> bytes:
+    if size not in _icon_cache:
+        _icon_cache[size] = _build_icon(size)
+    return _icon_cache[size]
+
+
+@app.get("/icon-{size}.png")
+def icon(size: int) -> Response:
+    """桌面图标。允许 180 / 192 / 512，其余按 192 处理。"""
+    if size not in (180, 192, 512):
+        size = 192
+    return Response(
+        content=icon_bytes(size),
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/manifest.webmanifest")
+def manifest() -> JSONResponse:
+    """PWA 清单：手机“添加到主屏幕”时读取。"""
+    return JSONResponse(
+        {
+            "name": "第4组聊天室",
+            "short_name": "聊天室",
+            "description": "局域网多房间实时聊天",
+            "start_url": "/",
+            "scope": "/",
+            "display": "standalone",
+            "orientation": "portrait",
+            "background_color": "#f6f8fa",
+            "theme_color": "#2563eb",
+            "lang": "zh-CN",
+            "icons": [
+                {"src": "/icon-180.png", "sizes": "180x180", "type": "image/png", "purpose": "any"},
+                {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+                {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+            ],
+        },
+        media_type="application/manifest+json",
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     """按房间分别汇报在线人数与消息数。"""
@@ -716,6 +827,15 @@ PAGE = """
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>第4组聊天室</title>
+
+<!-- 手机添加到桌面（PWA） -->
+<meta name="theme-color" content="#2563eb">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="第4组聊天室">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
 <style>
   :root { --line:#d8dee6; --muted:#7b8794; --bg:#f6f8fa; --blue:#2563eb; }
   *{box-sizing:border-box}
@@ -813,6 +933,12 @@ PAGE = """
 
   .receipt{display:block;font-size:11px;color:#cbd5e1;text-align:right;margin-top:3px}
 
+  /* 添加到主屏幕提示 */
+  #pwaHint{display:flex;gap:10px;align-items:center;justify-content:center;
+           flex-wrap:wrap;padding:10px 14px;background:#1d4ed8;color:#fff;font-size:12.5px}
+  #pwaHint button{border:0;background:rgba(255,255,255,.22);color:#fff;
+                  border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
+
   /* 轻量提示条 */
   #toast{position:fixed;left:50%;bottom:132px;z-index:40;
          transform:translateX(-50%) translateY(8px);
@@ -835,6 +961,11 @@ PAGE = """
 </style>
 </head>
 <body>
+
+<div id="pwaHint" class="hidden">
+  <span>把聊天室加到手机桌面：点浏览器菜单 →「添加到主屏幕」</span>
+  <button onclick="dismissHint()">知道了</button>
+</div>
 
 <div id="join">
   <div class="card">
@@ -1602,7 +1733,22 @@ $("list").addEventListener("scroll", () => {
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 $("name").addEventListener("keydown", (e) => { if (e.key === "Enter") doJoin(false); });
 
+// 只在手机浏览器、且还没加到桌面时提示
+function setupPwaHint() {
+  const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+  const standalone = window.matchMedia("(display-mode: standalone)").matches
+                     || navigator.standalone === true;
+  const dismissed = localStorage.getItem("chat.pwaHint") === "1";
+  if (isMobile && !standalone && !dismissed) $("pwaHint").classList.remove("hidden");
+}
+
+function dismissHint() {
+  localStorage.setItem("chat.pwaHint", "1");
+  $("pwaHint").classList.add("hidden");
+}
+
 restoreNickname();
+setupPwaHint();
 connect();
 </script>
 </body>
