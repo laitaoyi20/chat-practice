@@ -16,3 +16,10 @@ wheels/
 
 # 运行日志
 *.log
+
+# 安卓构建产物
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
