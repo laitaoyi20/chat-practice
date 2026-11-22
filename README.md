@@ -131,9 +131,36 @@ chat-practice/
 ├── chat.db          # SQLite 数据库（首次启动自动生成，不提交）
 ├── pyproject.toml   # 依赖清单
 ├── uv.lock          # 依赖版本锁
+├── android/         # 安卓壳工程（WebView，可选）
+├── .github/workflows/build-apk.yml   # 云端编译 APK
 ├── README.md
 └── .venv/           # 虚拟环境（不提交）
 ```
+
+---
+
+## 安卓 App（APK）
+
+`android/` 里是一个极小的 WebView 壳：**不含任何聊天逻辑**，打开后加载这台电脑上的网页，因此界面和浏览器完全一样，只是全屏、没有地址栏。
+
+### 怎么拿到 APK
+
+1. 打开仓库的 **Actions** 页面 → `Build APK`
+2. 点最新一次绿色的运行记录
+3. 滚动到底部 **Artifacts** → 下载 `lanchat-apk.zip`
+4. 解压得到 `app-debug.apk`，传到手机安装（需允许「未知来源」）
+
+### 什么时候会自动重新编译
+
+只要提交里改动了 `android/` 目录，GitHub 就会自动编译一次；也可以在 Actions 页面手动点 `Run workflow`。
+
+### 安装后怎么用
+
+1. 首次打开会要求填服务器地址，例如 `http://192.168.1.236:8000`
+2. 地址保存在本机，以后直接进入
+3. **IP 变了**：在 App 内按返回键回到地址页，改一下即可，不用重装
+
+> APK 里的地址是运行时输入的，不是打包时写死的，所以换网络不用重新编译。
 
 ---
 
@@ -143,15 +170,17 @@ chat-practice/
 
 | 表 | 字段 | 作用 |
 | --- | --- | --- |
-| `users` | id, ip, name, created_at, last_seen_at | 身份档案，唯一键 `(ip, name)` |
-| `messages` | id, user_id, name, ip, text, created_at, status, recalled_at, client_id | 消息本体；`status=recalled` 表示已撤回 |
-| `read_state` | user_id, last_read_id, updated_at | 每人读到了哪条，用于算未读 |
+| `users` | id, **room**, ip, name, created_at, last_seen_at | 身份档案，唯一键 `(room, ip, name)` |
+| `messages` | id, **room**, user_id, name, ip, text, created_at, status, recalled_at, client_id | 消息本体；`status=recalled` 表示已撤回 |
+| `read_state` | user_id, last_read_id, updated_at | 每人读到了哪条，用于算已读回执 |
 
 设计要点：
 
+- 三张表都用 `room` 字段隔离房间，所有查询都带 `WHERE room=?`。
 - `messages.client_id` 上有唯一索引 `(user_id, client_id)`，**重试不会产生重复消息**。
 - 撤回不删除记录，只把 `status` 改成 `recalled`，历史里永远显示「已撤回」。
 - 已读位置只增不减，避免乱序请求把进度改回去。
+- 已读回执按 `user_id` 判身份，**同名不同设备是两个人**。
 - `chat.db` 已加入 `.gitignore`，每台机器各自一份，不随仓库分发。
 
 ---
